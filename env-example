@@ -1,0 +1,5 @@
+# Rename this file to .env and update the values before running the bot.
+
+# Telegram bot token from BotFather
+BOT_TOKEN=your-telegram-bot-token-here
+

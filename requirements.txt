@@ -1,0 +1,3 @@
+python-dotenv
+python_telegram_bot==21.9
+requests
