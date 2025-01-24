@@ -78,11 +78,13 @@ def init_db():
                 last_seen INTEGER
             )
         """)
+        # Modified: added experimental_r1 column to user_settings
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
                 default_model TEXT,
-                active_conversation_id INTEGER
+                active_conversation_id INTEGER,
+                experimental_r1 BOOLEAN DEFAULT 0
             )
         """)
         c.execute("""
@@ -111,7 +113,21 @@ def init_db():
                 timestamp INTEGER NOT NULL
             )
         """)
+	c.execute("""
+            ALTER TABLE user_settings ADD COLUMN speak_responses BOOLEAN DEFAULT 0
+        """)
     conn.close()
+def is_speak_responses_enabled(user_id: int) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT speak_responses FROM user_settings WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return bool(row[0]) if row else False
+
+def set_speak_responses(user_id: int, enabled: bool):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE user_settings SET speak_responses = ? WHERE user_id = ?", (int(enabled), user_id))
 
 def upsert_user(telegram_user: User):
     user_id = telegram_user.id
@@ -139,11 +155,15 @@ def upsert_user(telegram_user: User):
 def get_user_settings(user_id: int) -> dict:
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("SELECT default_model, active_conversation_id FROM user_settings WHERE user_id = ?", (user_id,))
+        c.execute("SELECT default_model, active_conversation_id, experimental_r1 FROM user_settings WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         if row:
-            return {"default_model": row[0], "active_conversation_id": row[1]}
-    return {"default_model": DEFAULT_MODEL, "active_conversation_id": None}
+            return {
+                "default_model": row[0],
+                "active_conversation_id": row[1],
+                "experimental_r1": bool(row[2]),
+            }
+    return {"default_model": DEFAULT_MODEL, "active_conversation_id": None, "experimental_r1": False}
 
 def set_user_setting(user_id: int, field: str, value):
     with sqlite3.connect(DB_FILE) as conn:
@@ -244,6 +264,83 @@ def get_summaries(conversation_id: int) -> list:
             ORDER BY timestamp ASC
         """, (conversation_id,))
         return [r[0] for r in c.fetchall()]
+import soundfile as sf
+from kokoro_onnx import Kokoro
+import subprocess
+
+kokoro = Kokoro("kokoro-v0_19.onnx", "voices.npz")
+
+def generate_tts_ogg(text: str, voice: str, speed: float, user_id: int) -> str:
+    """
+    Generates speech from text using Kokoro-ONNX and converts it to .ogg format.
+    Returns the generated .ogg file path.
+    """
+    try:
+        samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
+        wav_file = f"tts_{user_id}.wav"
+        ogg_file = f"tts_{user_id}.ogg"
+
+        # Save as .wav
+        sf.write(wav_file, samples, sample_rate)
+
+        # Convert to .ogg (Opus format) for Telegram voice note
+        subprocess.run(["ffmpeg", "-i", wav_file, "-c:a", "libopus", "-b:a", "64k", ogg_file, "-y"], check=True)
+
+        os.remove(wav_file)  # Cleanup WAV file
+        return ogg_file
+    except Exception as e:
+        logger.error(f"TTS Generation Failed: {e}")
+        return None
+
+# ------------------------------------------------------------------------------
+# NEW: Helper functions for Experimental R1 Mode
+# ------------------------------------------------------------------------------
+def is_experimental_r1(user_id: int) -> bool:
+    """
+    Checks if the user has experimental R1 mode enabled.
+    """
+    s = get_user_settings(user_id)
+    return s.get("experimental_r1", False)
+
+def set_experimental_r1(user_id: int, enabled: bool):
+    """
+    Enables or disables R1 mode for the specified user.
+    """
+    set_user_setting(user_id, "experimental_r1", int(enabled))
+
+# ------------------------------------------------------------------------------
+# NEW: Delete a conversation
+# ------------------------------------------------------------------------------
+def delete_conversation(user_id: int, conversation_id: int) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        # Verify ownership
+        c.execute("""
+            SELECT conversation_id FROM user_conversations
+            WHERE conversation_id = ? AND user_id = ?
+        """, (conversation_id, user_id))
+        if not c.fetchone():
+            return False
+
+        # Delete associated messages
+        c.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        # Delete associated summaries
+        c.execute("DELETE FROM conversation_summary WHERE conversation_id = ?", (conversation_id,))
+        # Delete the conversation itself
+        c.execute("DELETE FROM user_conversations WHERE conversation_id = ?", (conversation_id,))
+
+        # Unset if was active
+        c.execute("""
+            SELECT active_conversation_id FROM user_settings
+            WHERE user_id = ?
+        """, (user_id,))
+        row = c.fetchone()
+        if row and row[0] == conversation_id:
+            c.execute("""
+                UPDATE user_settings SET active_conversation_id = NULL
+                WHERE user_id = ?
+            """, (user_id,))
+    return True
 
 # ------------------------------------------------------------------------------
 # LM Studio API Calls
@@ -257,34 +354,64 @@ def list_models() -> dict:
         logger.error(f"Error listing models: {e}")
         return {"error": str(e)}
 
-def call_lm_studio_chat(messages: list, model: str) -> dict:
+# MODIFIED: accept user_id and switch endpoints if in R1 mode
+def call_lm_studio_chat(messages: list, model: str, user_id: int) -> dict:
     try:
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": conversation_params["max_tokens"],
-            "temperature": conversation_params["temperature"],
-            "top_p": conversation_params["top_p"],
-            "top_k": conversation_params["top_k"],
-            "presence_penalty": conversation_params["presence_penalty"],
-            "frequency_penalty": conversation_params["frequency_penalty"],
-            "logit_bias": conversation_params["logit_bias"],
-        }
-        if conversation_params["stop"] is not None:
-            payload["stop"] = conversation_params["stop"]
-        if conversation_params["repeat_penalty"] is not None:
-            payload["repeat_penalty"] = conversation_params["repeat_penalty"]
-        if conversation_params["seed"] is not None:
-            payload["seed"] = conversation_params["seed"]
-        resp = requests.post(LM_STUDIO_CHAT_COMPLETIONS_URL, headers=headers, json=payload)
+
+        if is_experimental_r1(user_id):
+            # Use the completions endpoint in R1 mode
+            prompt = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": conversation_params["max_tokens"],
+                "temperature": conversation_params["temperature"],
+                "top_p": conversation_params["top_p"],
+                "top_k": conversation_params["top_k"],
+                "presence_penalty": conversation_params["presence_penalty"],
+                "frequency_penalty": conversation_params["frequency_penalty"],
+                "logit_bias": conversation_params["logit_bias"],
+            }
+            if conversation_params["stop"] is not None:
+                payload["stop"] = conversation_params["stop"]
+            if conversation_params["repeat_penalty"] is not None:
+                payload["repeat_penalty"] = conversation_params["repeat_penalty"]
+            if conversation_params["seed"] is not None:
+                payload["seed"] = conversation_params["seed"]
+
+            url = LM_STUDIO_COMPLETIONS_URL
+        else:
+            # Use the chat completions endpoint normally
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": conversation_params["max_tokens"],
+                "temperature": conversation_params["temperature"],
+                "top_p": conversation_params["top_p"],
+                "top_k": conversation_params["top_k"],
+                "presence_penalty": conversation_params["presence_penalty"],
+                "frequency_penalty": conversation_params["frequency_penalty"],
+                "logit_bias": conversation_params["logit_bias"],
+            }
+            if conversation_params["stop"] is not None:
+                payload["stop"] = conversation_params["stop"]
+            if conversation_params["repeat_penalty"] is not None:
+                payload["repeat_penalty"] = conversation_params["repeat_penalty"]
+            if conversation_params["seed"] is not None:
+                payload["seed"] = conversation_params["seed"]
+
+            url = LM_STUDIO_CHAT_COMPLETIONS_URL
+
+        resp = requests.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as e:
         logger.error(f"Error calling chat completions: {e}")
         return {"error": str(e)}
 
-def call_lm_studio_completions(prompt: str, model: str) -> dict:
+# MODIFIED: accept user_id to handle any R1-specific changes if needed
+def call_lm_studio_completions(prompt: str, model: str, user_id: int) -> dict:
     try:
         headers = {"Content-Type": "application/json"}
         payload = {
@@ -304,6 +431,9 @@ def call_lm_studio_completions(prompt: str, model: str) -> dict:
             payload["repeat_penalty"] = conversation_params["repeat_penalty"]
         if conversation_params["seed"] is not None:
             payload["seed"] = conversation_params["seed"]
+
+        # In R1 mode, you could do more customization here if needed
+        # Currently we treat it the same, just showing how user_id might be used
         resp = requests.post(LM_STUDIO_COMPLETIONS_URL, headers=headers, json=payload)
         resp.raise_for_status()
         return resp.json()
@@ -322,13 +452,16 @@ def call_lm_studio_embeddings(text: str, model: str) -> dict:
         logger.error(f"Error calling embeddings: {e}")
         return {"error": str(e)}
 
-def summarize_conversation(conversation_id: int, model: str) -> str:
+# MODIFIED: accept user_id and respect R1 mode if needed for summarization
+def summarize_conversation(conversation_id: int, model: str, user_id: int) -> str:
     msgs = get_messages(conversation_id)
     if not msgs:
         return "Nothing to summarize."
+
     joined = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
     prompt = f"Summarize:\n\n{joined}\n\nSummary:"
-    data = call_lm_studio_completions(prompt, model)
+
+    data = call_lm_studio_completions(prompt, model, user_id)
     if "error" in data:
         return "Summary error."
     try:
@@ -367,7 +500,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for m in get_messages(cid):
         msgs.append({"role": m["role"], "content": m["content"]})
 
-    data = call_lm_studio_chat(msgs, model)
+    # Pass user.id to handle R1 mode logic
+    data = call_lm_studio_chat(msgs, model, user.id)
     if "error" in data:
         await update.message.reply_text(
             f"API Error: {data['error']}", parse_mode=ParseMode.MARKDOWN
@@ -375,7 +509,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        assistant_text = data["choices"][0]["message"]["content"]
+        # In R1 mode, the completions output differs from the chat output
+        if is_experimental_r1(user.id):
+            assistant_text = data["choices"][0]["text"].strip()
+        else:
+            assistant_text = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
     except:
         await update.message.reply_text(
@@ -390,7 +528,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_tokens = usage.get("total_tokens", 0)
         if total_tokens > TOKEN_THRESHOLD:
             # Summarize automatically
-            summary = summarize_conversation(cid, model)
+            summary = summarize_conversation(cid, model, user.id)
             append_summary(cid, summary)
             clear_conversation_messages(cid)
             usage_msg = "\n\n*Context summarized and reset.*"
@@ -437,7 +575,8 @@ async def summarize_thread_command(update: Update, context: ContextTypes.DEFAULT
 
     model = row[0] if row[0] else DEFAULT_MODEL
 
-    summary_text = summarize_conversation(cid, model)
+    # Pass user_id for R1 mode awareness
+    summary_text = summarize_conversation(cid, model, user_id)
     if summary_text.startswith("Summary error") or summary_text.startswith("Failed"):
         await update.message.reply_text(
             f"*Error summarizing conversation {cid}.*", parse_mode=ParseMode.MARKDOWN
@@ -669,7 +808,7 @@ async def completion_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Requesting completion with model: `{model}`...",
         parse_mode=ParseMode.MARKDOWN
     )
-    data = call_lm_studio_completions(prompt, model)
+    data = call_lm_studio_completions(prompt, model, user_id)
     if "error" in data:
         await update.message.reply_text(f"*Error:* {data['error']}", parse_mode=ParseMode.MARKDOWN)
         return
@@ -722,6 +861,66 @@ async def embedding_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("*No embedding data returned.*", parse_mode=ParseMode.MARKDOWN)
 
 # ------------------------------------------------------------------------------
+# NEW: Command Handler to Delete Conversation
+# ------------------------------------------------------------------------------
+async def delete_thread_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/delete_thread <conversation_id>`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    try:
+        conversation_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "*Invalid conversation ID.*", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    success = delete_conversation(user_id, conversation_id)
+    if success:
+        await update.message.reply_text(
+            f"*Conversation ID {conversation_id} has been deleted.*", parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            "*Conversation not found or you do not have permission to delete it.*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# ------------------------------------------------------------------------------
+# NEW: Command Handler to Toggle Experimental R1 Mode
+# ------------------------------------------------------------------------------
+async def toggle_r1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/toggle_r1 <on|off>`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    arg = args[0].lower()
+    if arg not in ["on", "off"]:
+        await update.message.reply_text(
+            "Invalid argument. Use `/toggle_r1 on` or `/toggle_r1 off`.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    enabled = (arg == "on")
+    set_experimental_r1(user_id, enabled)
+    status = "enabled" if enabled else "disabled"
+    await update.message.reply_text(
+        f"*Experimental R1 mode has been {status}.*", parse_mode=ParseMode.MARKDOWN
+    )
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 def main():
@@ -742,7 +941,10 @@ def main():
     app.add_handler(CommandHandler("list_models", list_models_command))
     app.add_handler(CommandHandler("completion", completion_command))
     app.add_handler(CommandHandler("embedding", embedding_command))
-    app.add_handler(CommandHandler("summarize_thread", summarize_thread_command))  # New command
+    app.add_handler(CommandHandler("summarize_thread", summarize_thread_command))
+    # NEW commands
+    app.add_handler(CommandHandler("delete_thread", delete_thread_command))
+    app.add_handler(CommandHandler("toggle_r1", toggle_r1_command))
 
     # Fallback chat messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
