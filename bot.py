@@ -201,6 +201,46 @@ def get_summaries(conversation_id: int) -> list:
         c = conn.cursor()
         c.execute("SELECT summary FROM conversation_summary WHERE conversation_id=? ORDER BY timestamp ASC", (conversation_id,))
         return [r[0] for r in c.fetchall()]
+async def summarize_thread_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+
+    # If user typed /summarize_thread <id>, use that ID; else active conversation
+    cid = None
+    if args:
+        try:
+            cid = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid conversation ID.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+    if not cid:
+        s = get_user_settings(user_id)
+        cid = s["active_conversation_id"]
+
+    if not cid:
+        await update.message.reply_text("No active conversation or invalid ID.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT model FROM user_conversations WHERE conversation_id = ?", (cid,))
+        row = c.fetchone()
+    if not row:
+        await update.message.reply_text("Conversation not found.", parse_mode=ParseMode.MARKDOWN)
+        return
+    model = row[0] if row[0] else DEFAULT_MODEL
+
+    summary_text = summarize_conversation(cid, model, user_id)
+    if summary_text.startswith("Summary error") or summary_text.startswith("Failed"):
+        await update.message.reply_text(f"Error summarizing conversation {cid}.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    append_summary(cid, summary_text)
+    await update.message.reply_text(
+        f"Summary for conversation {cid}:\n\n{summary_text}",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 def is_speak_responses_enabled(user_id: int) -> bool:
     with sqlite3.connect(DB_FILE) as conn:
