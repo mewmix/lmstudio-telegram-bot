@@ -555,28 +555,31 @@ def main():
 async def set_parameter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /set <param> <value>", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: /set <param> <value>")
         return
+    
     p, val = args[0].lower(), " ".join(args[1:])
+    
     if p in conversation_params:
         try:
-            if p in ["max_tokens","top_k"]:
+            if p in ["max_tokens", "top_k"]:
                 conversation_params[p] = int(val)
-            elif p in ["temperature","top_p","presence_penalty","frequency_penalty"]:
+            elif p in ["temperature", "top_p", "presence_penalty", "frequency_penalty"]:
                 conversation_params[p] = float(val)
             elif p == "stop":
-                conversation_params["stop"] = None if val.lower()=="none" else val
+                conversation_params["stop"] = None if val.lower() == "none" else val
             elif p == "repeat_penalty":
-                conversation_params[p] = None if val.lower()=="none" else float(val)
+                conversation_params[p] = None if val.lower() == "none" else float(val)
             elif p == "seed":
-                conversation_params[p] = None if val.lower()=="none" else int(val)
+                conversation_params[p] = None if val.lower() == "none" else int(val)
             else:
                 conversation_params[p] = val
-            await update.message.reply_text(f"Set {p} to {conversation_params[p]}", parse_mode=ParseMode.MARKDOWN)
-        except:
-            await update.message.reply_text(f"Invalid value for {p}: {val}", parse_mode=ParseMode.MARKDOWN)
+            
+            await update.message.reply_text(f"Set {p} to {conversation_params[p]}")
+        except ValueError:
+            await update.message.reply_text(f"Invalid value for {p}: {val}")
     else:
-        await update.message.reply_text(f"Unknown parameter: {p}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"Unknown parameter: {p}")
 
 async def show_parameters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{k} = {v}" for k, v in conversation_params.items()]
