@@ -579,9 +579,11 @@ async def set_parameter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Unknown parameter: {p}", parse_mode=ParseMode.MARKDOWN)
 
 async def show_parameters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [f"{k}={v}" for k,v in conversation_params.items()]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    lines = [f"{k} = {v}" for k, v in conversation_params.items()]
+    message = "\n".join(lines)
 
+    await update.message.reply_text(f"Parameters:\n\n{message}")
+    
 async def clear_context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     s = get_user_settings(uid)
